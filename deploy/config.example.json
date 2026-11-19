@@ -11,5 +11,5 @@
   "maxBuffered": 200,
   "extraRules": [],
   "ombEventsDir": "~/.openmausbot/events",
-  "followUpHours": 72
+  "followUpHours": 336
 }

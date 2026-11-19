@@ -38,13 +38,13 @@ Thành viên nhắn, gửi ảnh/file (không tag)        Chủ nhóm: "@<tài k
   - Cần chủ nhóm quyết định thì viết `@<ownerName>`.
   - Không cần nói gì thì trả `NO_REPLY`.
   - Có thể thêm luật riêng bằng `extraRules`.
-- **Trả lời:**
+- **Trả lời** (mọi câu của một việc, gồm "đã nhận", câu trả lời đầu và các cập nhật sau, đều gửi dạng trả lời có trích tin giao việc gốc, nên biết ngay cập nhật cho yêu cầu nào; nếu Zalo từ chối trích thì gửi tin thường):
   - `200`: gửi ngay.
   - `202 working`: báo "Đã nhận, <botName> đang xử lý" một lần, rồi 30 giây hỏi lại một lần, tối đa 6 giờ.
   - `202 needs_approval`: tag chủ nhóm để vào OpenMausBot duyệt.
   - Chữ `@<ownerName>` được đổi thành tag thật.
   - Câu dài hơn 1800 ký tự được tách nhiều tin. Markdown bị bỏ.
-- **Câu trả lời lượt sau:** bot thường trả lời ngay một câu ("đã giao team"), rồi khi team làm xong lại viết thêm câu trả lời trong cùng thread. `GET` của Bot API chỉ trả câu đầu tiên, nên bridge đọc thẳng log sự kiện của thread trong `ombEventsDir` (OpenMausBot chạy cùng máy). Mỗi câu trả lời hoàn chỉnh mới (`item.completed` / `assistant_text`) được gửi vào nhóm đúng một lần. Mỗi thread được theo dõi trong `followUpHours` giờ, danh sách lưu trong file state nên restart không mất. Đây là định dạng nội bộ của OpenMausBot; nếu bản OpenMausBot mới đổi định dạng thì phần này cần cập nhật.
+- **Câu trả lời lượt sau:** bot thường trả lời ngay một câu ("đã giao team"), rồi khi team làm xong lại viết thêm câu trả lời trong cùng thread. `GET` của Bot API chỉ trả câu đầu tiên, nên bridge đọc thẳng log sự kiện của thread trong `ombEventsDir` (OpenMausBot chạy cùng máy). Mỗi câu trả lời hoàn chỉnh mới (`item.completed` / `assistant_text`) được gửi vào nhóm đúng một lần. Mỗi thread được theo dõi trong `followUpHours` giờ (mặc định 14 ngày), danh sách lưu trong file state nên restart không mất. Prompt dặn bot báo lại trong chính thread khi xong và mở đầu bằng việc gì đã xong. Đây là định dạng nội bộ của OpenMausBot; nếu bản OpenMausBot mới đổi định dạng thì phần này cần cập nhật.
 - **Lỗi khi gọi bot:** đưa tin trở lại bộ đệm và tag chủ nhóm để thử lại.
 
 ## Yêu cầu
@@ -116,7 +116,7 @@ node check-groups.mjs <groupId>    # liệt kê thành viên: <uid>  <tên>, tì
 | `maxBuffered` | | Số tin tối đa giữ trong bộ đệm, mặc định 200 |
 | `extraRules` | | Mảng câu dặn thêm cho bot, ví dụ `"Việc kỹ thuật giao cho trưởng IT"` |
 | `ombEventsDir` | | Thư mục log sự kiện của OpenMausBot, mặc định `~/.openmausbot/events` |
-| `followUpHours` | | Theo dõi câu trả lời lượt sau trong bao nhiêu giờ, mặc định 72 |
+| `followUpHours` | | Theo dõi câu trả lời lượt sau trong bao nhiêu giờ, mặc định 336 (14 ngày) |
 
 Muốn đặt cấu hình và state ở chỗ khác thì dùng biến môi trường `ZALO_BRIDGE_CONFIG_DIR` và `ZALO_BRIDGE_STATE_DIR`.
 

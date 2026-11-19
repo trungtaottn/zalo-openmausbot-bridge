@@ -7,7 +7,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { loginZalo, normalizeGroupMessage, sendGroupText, ThreadType } from "./zalo.mjs";
+import { loginZalo, normalizeGroupMessage, sendGroupText, quoteRefOf, ThreadType } from "./zalo.mjs";
 
 const CONF_DIR = process.env.ZALO_BRIDGE_CONFIG_DIR || path.join(os.homedir(), ".config/zalo-openmausbot-bridge");
 const STATE_DIR = process.env.ZALO_BRIDGE_STATE_DIR || path.join(os.homedir(), ".local/state/zalo-openmausbot-bridge");
@@ -21,7 +21,7 @@ const cfg = {
   maxBuffered: 200,
   extraRules: [],
   ombEventsDir: "~/.openmausbot/events",
-  followUpHours: 72,
+  followUpHours: 336,
   ...JSON.parse(fs.readFileSync(path.join(CONF_DIR, "config.json"), "utf8")),
 };
 cfg.inboxDir = expandHome(cfg.inboxDir);
@@ -94,6 +94,7 @@ function buildPrompt(trigger, buffered) {
     `- Việc nội bộ (giao việc cho team, issue, PR, tiến độ chi tiết) em xử lý và báo ${owner} trong OpenMausBot như bình thường, không đưa vào câu trả lời này.`,
     `- Cần ${owner} quyết định thì viết "@${cfg.ownerName}" kèm câu hỏi ngắn; hệ thống sẽ tag thật.`,
     `- Nếu không cần nói gì vào nhóm, trả lời đúng một từ: NO_REPLY`,
+    `- Việc cần thời gian (giao team, chờ kết quả): khi xong hoặc có tiến triển đáng báo, hãy báo lại ngay trong chính cuộc trò chuyện này, dù là nhiều giờ sau. Mỗi lần báo thêm cũng lên nhóm, trả lời vào đúng tin yêu cầu gốc, nên hãy mở đầu bằng việc gì đã xong hoặc đang ở bước nào (nhắc lại yêu cầu thật ngắn), rồi kết quả và cách dùng hoặc kiểm tra; đừng chỉ viết "xong rồi".`,
     ...cfg.extraRules.map((r) => `- ${r}`),
   ].join("\n");
 }
@@ -163,10 +164,10 @@ function completedAnswers(thread) {
   return out;
 }
 
-function watchThread(thread) {
+function watchThread(thread, quote) {
   if (!thread || state.watch.some((w) => w.thread === thread)) return;
   const seen = completedAnswers(thread).map((a) => a.id);
-  state.watch.push({ thread, seen, until: Date.now() + cfg.followUpHours * 3600_000 });
+  state.watch.push({ thread, seen, quote, until: Date.now() + cfg.followUpHours * 3600_000 });
   saveState();
   log(`watching thread=${thread.slice(0, 8)} seen=${seen.length}`);
 }
@@ -186,7 +187,10 @@ function startFollowUps(send) {
         const text = stripMarkdown(a.text).trim();
         if (!text || text === "NO_REPLY") continue;
         log(`follow-up thread=${w.thread.slice(0, 8)} item=${a.id.slice(-8)}`);
-        for (const part of chunks(text)) await send(part).catch((err) => log(`follow-up send failed: ${err.message}`));
+        const parts = chunks(text);
+        for (let i = 0; i < parts.length; i++) {
+          await send(parts[i], i === 0 ? w.quote : null).catch((err) => log(`follow-up send failed: ${err.message}`));
+        }
       }
     }
     if (changed) saveState();
@@ -197,8 +201,15 @@ async function main() {
   const api = await loginZalo(path.join(CONF_DIR, "zalo_credentials.json"));
   const selfId = String(api.getOwnId());
   log(`logged in as ${selfId}, watching group ${cfg.groupId}`);
-  const send = async (t) => {
-    const r = await sendGroupText(api, cfg.groupId, t, cfg.ownerUid, cfg.ownerName);
+  const send = async (t, quote = null) => {
+    let r;
+    try {
+      r = await sendGroupText(api, cfg.groupId, t, cfg.ownerUid, cfg.ownerName, quote);
+    } catch (err) {
+      if (!quote) throw err;
+      log(`quoted send failed (${err.message}), sending without quote`);
+      r = await sendGroupText(api, cfg.groupId, t, cfg.ownerUid, cfg.ownerName);
+    }
     log(`sent group msgId=${r?.message?.msgId || "none"} len=${t.length}`);
     return r;
   };
@@ -208,6 +219,7 @@ async function main() {
     if (msg.type !== ThreadType.Group || msg.isSelf || msg.threadId !== cfg.groupId) return;
     const rec = await normalizeGroupMessage(msg, cfg.inboxDir, log, api);
     delete rec.raw;
+    const quote = quoteRefOf(msg.data);
     const isTrigger = rec.senderId === cfg.ownerUid && rec.mentions.includes(selfId);
     if (!isTrigger) {
       state.buffer.push(rec);
@@ -222,22 +234,22 @@ async function main() {
     log(`trigger msg=${rec.msgId} buffered=${buffered.length}`);
     try {
       const { reply, thread } = await askBot(buildPrompt(rec, buffered), {
-        onWorking: () => send(`Đã nhận, ${cfg.botName} đang xử lý, có kết quả em báo ngay.`),
-        onApproval: () => send(`@${cfg.ownerName} ${cfg.botName} cần duyệt một bước trong OpenMausBot.`),
+        onWorking: () => send(`Đã nhận, ${cfg.botName} đang xử lý, có kết quả em báo ngay.`, quote),
+        onApproval: () => send(`@${cfg.ownerName} ${cfg.botName} cần duyệt một bước trong OpenMausBot.`, quote),
       });
       const text = reply ? stripMarkdown(reply).trim() : "";
       if (!text || text === "NO_REPLY") log("bot: NO_REPLY");
       else {
         const parts = chunks(text);
-        for (const part of parts) await send(part);
+        for (let i = 0; i < parts.length; i++) await send(parts[i], i === 0 ? quote : null);
         log(`posted reply parts=${parts.length}`);
       }
-      watchThread(thread);
+      watchThread(thread, quote);
     } catch (err) {
       state.buffer.unshift(...buffered);
       saveState();
       log(`hand-off failed: ${err.message}`);
-      await send(`@${cfg.ownerName} chưa chuyển được cho ${cfg.botName} (${err.message.slice(0, 120)}). Tag lại sau ít phút nhé.`).catch(() => {});
+      await send(`@${cfg.ownerName} chưa chuyển được cho ${cfg.botName} (${err.message.slice(0, 120)}). Tag lại sau ít phút nhé.`, quote).catch(() => {});
     }
   });
 

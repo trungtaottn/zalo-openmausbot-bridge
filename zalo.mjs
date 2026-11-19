@@ -206,8 +206,17 @@ export async function normalizeGroupMessage(msg, inboxDir, log, api = null) {
   return rec;
 }
 
-// Sends text to a group. Every "@<ownerName>" occurrence becomes a real mention of ownerUid.
-export async function sendGroupText(api, groupId, text, ownerUid, ownerName) {
+// Minimal copy of a message that zca-js needs to send a reply quoting it.
+export function quoteRefOf(d) {
+  return {
+    content: d.content, msgType: d.msgType, propertyExt: d.propertyExt,
+    uidFrom: String(d.uidFrom), msgId: d.msgId, cliMsgId: d.cliMsgId, ts: d.ts, ttl: d.ttl ?? 0,
+  };
+}
+
+// Sends text to a group, optionally as a reply quoting `quote` (see quoteRefOf).
+// Every "@<ownerName>" occurrence becomes a real mention of ownerUid.
+export async function sendGroupText(api, groupId, text, ownerUid, ownerName, quote = null) {
   const tag = `@${ownerName}`;
   const mentions = [];
   let i = text.indexOf(tag);
@@ -216,6 +225,7 @@ export async function sendGroupText(api, groupId, text, ownerUid, ownerName) {
     i = text.indexOf(tag, i + tag.length);
   }
   const content = mentions.length ? { msg: text, mentions } : { msg: text };
+  if (quote) content.quote = quote;
   return api.sendMessage(content, groupId, ThreadType.Group);
 }
 
