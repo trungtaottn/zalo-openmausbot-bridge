@@ -1,0 +1,13 @@
+{
+  "groupId": "<mã nhóm Zalo, lấy bằng check-groups.mjs>",
+  "ownerUid": "<UID Zalo của người được ra lệnh, lấy bằng check-groups.mjs>",
+  "ownerName": "Anh",
+  "ownerLabel": "chủ nhóm",
+  "botId": "<id bot trong OpenMausBot>",
+  "botName": "Luna",
+  "botApiBase": "http://127.0.0.1:8800/hooks/api/bots",
+  "project": "",
+  "inboxDir": "~/zalo-inbox",
+  "maxBuffered": 200,
+  "extraRules": []
+}

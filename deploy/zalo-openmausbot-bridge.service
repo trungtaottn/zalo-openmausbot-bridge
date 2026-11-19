@@ -1,0 +1,13 @@
+[Unit]
+Description=Zalo group bridge to an OpenMausBot bot
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/Code/zalo-openmausbot-bridge
+ExecStart=/usr/bin/env node %h/Code/zalo-openmausbot-bridge/bridge.mjs
+Restart=always
+RestartSec=15
+UMask=0077
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,9 @@
+node_modules/
+*.png
+.env*
+# Secrets and runtime data live in ~/.config and ~/.local/state; never commit copies.
+config.json
+bot_api_key
+*credentials*.json
+state.json
+zalo-inbox/
