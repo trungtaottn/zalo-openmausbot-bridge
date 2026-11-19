@@ -13,7 +13,6 @@
   "dependencies": {
     "zca-js": "2.3.0"
   },
-  "license": "MIT",
   "engines": {
     "node": ">=18"
   }

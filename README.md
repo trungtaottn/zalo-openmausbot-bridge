@@ -169,6 +169,6 @@ Thử: một thành viên nhắn vài tin kèm ảnh, rồi chủ nhóm tag tài
 - **Dữ liệu của khách:** tin và file được lưu trên máy chạy bridge (`inboxDir`, file state) và đi vào thread của bot trong OpenMausBot. Chưa có lịch tự xóa `inboxDir`. Hãy báo cho thành viên nhóm biết nếu cần.
 - Bridge chỉ nghe được tin khi đang chạy. Tin gửi lúc dừng không được bù lại.
 
-## Giấy phép
+## Thư viện
 
-MIT. Xem [LICENSE](LICENSE). Dùng [zca-js](https://github.com/RFS-ADRENO/zca-js) (MIT) để giao tiếp với Zalo.
+Dùng [zca-js](https://github.com/RFS-ADRENO/zca-js) để giao tiếp với Zalo.
