@@ -9,5 +9,7 @@
   "project": "",
   "inboxDir": "~/zalo-inbox",
   "maxBuffered": 200,
-  "extraRules": []
+  "extraRules": [],
+  "ombEventsDir": "~/.openmausbot/events",
+  "followUpHours": 72
 }

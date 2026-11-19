@@ -44,6 +44,7 @@ Thành viên nhắn, gửi ảnh/file (không tag)        Chủ nhóm: "@<tài k
   - `202 needs_approval`: tag chủ nhóm để vào OpenMausBot duyệt.
   - Chữ `@<ownerName>` được đổi thành tag thật.
   - Câu dài hơn 1800 ký tự được tách nhiều tin. Markdown bị bỏ.
+- **Câu trả lời lượt sau:** bot thường trả lời ngay một câu ("đã giao team"), rồi khi team làm xong lại viết thêm câu trả lời trong cùng thread. `GET` của Bot API chỉ trả câu đầu tiên, nên bridge đọc thẳng log sự kiện của thread trong `ombEventsDir` (OpenMausBot chạy cùng máy). Mỗi câu trả lời hoàn chỉnh mới (`item.completed` / `assistant_text`) được gửi vào nhóm đúng một lần. Mỗi thread được theo dõi trong `followUpHours` giờ, danh sách lưu trong file state nên restart không mất. Đây là định dạng nội bộ của OpenMausBot; nếu bản OpenMausBot mới đổi định dạng thì phần này cần cập nhật.
 - **Lỗi khi gọi bot:** đưa tin trở lại bộ đệm và tag chủ nhóm để thử lại.
 
 ## Yêu cầu
@@ -114,6 +115,8 @@ node check-groups.mjs <groupId>    # liệt kê thành viên: <uid>  <tên>, tì
 | `inboxDir` | | Nơi lưu file tải về, mặc định `~/zalo-inbox` |
 | `maxBuffered` | | Số tin tối đa giữ trong bộ đệm, mặc định 200 |
 | `extraRules` | | Mảng câu dặn thêm cho bot, ví dụ `"Việc kỹ thuật giao cho trưởng IT"` |
+| `ombEventsDir` | | Thư mục log sự kiện của OpenMausBot, mặc định `~/.openmausbot/events` |
+| `followUpHours` | | Theo dõi câu trả lời lượt sau trong bao nhiêu giờ, mặc định 72 |
 
 Muốn đặt cấu hình và state ở chỗ khác thì dùng biến môi trường `ZALO_BRIDGE_CONFIG_DIR` và `ZALO_BRIDGE_STATE_DIR`.
 
@@ -143,6 +146,7 @@ Thử: một thành viên nhắn vài tin kèm ảnh, rồi chủ nhóm tag tài
   - `trigger msg=… buffered=N`: chủ nhóm vừa tag, N tin được gửi kèm.
   - `bot-api POST status=200|202 thread=…`: bot đã nhận.
   - `sent group msgId=…`: tin đã lên Zalo.
+  - `watching thread=…` / `follow-up thread=…`: đang theo dõi, hoặc vừa gửi câu trả lời lượt sau.
 - **Khởi động lại:** `systemctl --user restart zalo-openmausbot-bridge`. Bộ đệm lưu trong file nên không mất.
 - **Phiên Zalo hết hạn** (log báo `Đăng nhập thất bại` hoặc `listener closed` lặp lại): `systemctl --user stop zalo-openmausbot-bridge`, chạy `node login-qr.mjs`, rồi `start` lại.
 - **Xem tin gần nhất trong nhóm:** `node check-history.mjs 12`, chỉ in bản xem trước ngắn.

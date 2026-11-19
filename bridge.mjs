@@ -20,9 +20,12 @@ const cfg = {
   inboxDir: "~/zalo-inbox",
   maxBuffered: 200,
   extraRules: [],
+  ombEventsDir: "~/.openmausbot/events",
+  followUpHours: 72,
   ...JSON.parse(fs.readFileSync(path.join(CONF_DIR, "config.json"), "utf8")),
 };
 cfg.inboxDir = expandHome(cfg.inboxDir);
+cfg.ombEventsDir = expandHome(cfg.ombEventsDir);
 for (const k of ["groupId", "ownerUid", "botId", "botApiBase"]) {
   if (!cfg[k]) throw new Error(`config.json thiếu "${k}"`);
 }
@@ -35,6 +38,7 @@ const loadState = () => {
   try { return JSON.parse(fs.readFileSync(STATE_PATH, "utf8")); } catch { return { buffer: [] }; }
 };
 let state = loadState();
+state.watch ||= [];
 const saveState = () => fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 1), { mode: 0o600 });
 
 const ZALO_MAX = 1800;
@@ -127,7 +131,7 @@ async function askBot(prompt, { onWorking, onApproval }) {
   let toldApproval = false;
   const deadline = Date.now() + 6 * 60 * 60 * 1000;
   for (;;) {
-    if (status === 200) return extractReply(body);
+    if (status === 200) return { reply: extractReply(body), thread };
     if (status !== 202 || !thread) throw new Error(`Bot API ${status}: ${JSON.stringify(body).slice(0, 200)}`);
     if (body.status === "needs_approval" && !toldApproval) { toldApproval = true; await onApproval(); }
     else if (!toldWorking) { toldWorking = true; await onWorking(); }
@@ -138,10 +142,67 @@ async function askBot(prompt, { onWorking, onApproval }) {
   }
 }
 
+// Follow-ups: a bot often answers once ("handed to the team"), then writes a
+// second answer in the same thread when the work is done. The Bot API GET only
+// returns the first answer, so completed answers are read from OpenMausBot's
+// own event log for that thread (same machine) and posted once each.
+function completedAnswers(thread) {
+  const file = path.join(cfg.ombEventsDir, `${thread}.ndjson`);
+  let raw;
+  try { raw = fs.readFileSync(file, "utf8"); } catch { return []; }
+  const out = [];
+  for (const line of raw.split("\n")) {
+    if (!line.includes("assistant_text")) continue;
+    try {
+      const e = JSON.parse(line);
+      if (e.type === "item.completed" && e.itemType === "assistant_text" && typeof e.text === "string") {
+        out.push({ id: e.itemId, text: e.text });
+      }
+    } catch { /* partial line while being written */ }
+  }
+  return out;
+}
+
+function watchThread(thread) {
+  if (!thread || state.watch.some((w) => w.thread === thread)) return;
+  const seen = completedAnswers(thread).map((a) => a.id);
+  state.watch.push({ thread, seen, until: Date.now() + cfg.followUpHours * 3600_000 });
+  saveState();
+  log(`watching thread=${thread.slice(0, 8)} seen=${seen.length}`);
+}
+
+function startFollowUps(send) {
+  setInterval(async () => {
+    const now = Date.now();
+    const before = state.watch.length;
+    state.watch = state.watch.filter((w) => w.until > now);
+    let changed = state.watch.length !== before;
+    for (const w of state.watch) {
+      for (const a of completedAnswers(w.thread)) {
+        if (w.seen.includes(a.id)) continue;
+        w.seen.push(a.id);
+        changed = true;
+        saveState();
+        const text = stripMarkdown(a.text).trim();
+        if (!text || text === "NO_REPLY") continue;
+        log(`follow-up thread=${w.thread.slice(0, 8)} item=${a.id.slice(-8)}`);
+        for (const part of chunks(text)) await send(part).catch((err) => log(`follow-up send failed: ${err.message}`));
+      }
+    }
+    if (changed) saveState();
+  }, 30_000);
+}
+
 async function main() {
   const api = await loginZalo(path.join(CONF_DIR, "zalo_credentials.json"));
   const selfId = String(api.getOwnId());
   log(`logged in as ${selfId}, watching group ${cfg.groupId}`);
+  const send = async (t) => {
+    const r = await sendGroupText(api, cfg.groupId, t, cfg.ownerUid, cfg.ownerName);
+    log(`sent group msgId=${r?.message?.msgId || "none"} len=${t.length}`);
+    return r;
+  };
+  startFollowUps(send);
 
   api.listener.on("message", async (msg) => {
     if (msg.type !== ThreadType.Group || msg.isSelf || msg.threadId !== cfg.groupId) return;
@@ -159,21 +220,19 @@ async function main() {
     const buffered = state.buffer.splice(0);
     saveState();
     log(`trigger msg=${rec.msgId} buffered=${buffered.length}`);
-    const send = async (t) => {
-      const r = await sendGroupText(api, cfg.groupId, t, cfg.ownerUid, cfg.ownerName);
-      log(`sent group msgId=${r?.message?.msgId || "none"} len=${t.length}`);
-      return r;
-    };
     try {
-      const reply = await askBot(buildPrompt(rec, buffered), {
+      const { reply, thread } = await askBot(buildPrompt(rec, buffered), {
         onWorking: () => send(`Đã nhận, ${cfg.botName} đang xử lý, có kết quả em báo ngay.`),
         onApproval: () => send(`@${cfg.ownerName} ${cfg.botName} cần duyệt một bước trong OpenMausBot.`),
       });
       const text = reply ? stripMarkdown(reply).trim() : "";
-      if (!text || text === "NO_REPLY") { log("bot: NO_REPLY"); return; }
-      const parts = chunks(text);
-      for (const part of parts) await send(part);
-      log(`posted reply parts=${parts.length}`);
+      if (!text || text === "NO_REPLY") log("bot: NO_REPLY");
+      else {
+        const parts = chunks(text);
+        for (const part of parts) await send(part);
+        log(`posted reply parts=${parts.length}`);
+      }
+      watchThread(thread);
     } catch (err) {
       state.buffer.unshift(...buffered);
       saveState();
