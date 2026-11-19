@@ -7,7 +7,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { loginZalo, normalizeGroupMessage, sendGroupText, quoteRefOf, ThreadType } from "./zalo.mjs";
+import { loginZalo, normalizeGroupMessage, sendGroupText, sendGroupFiles, quoteRefOf, ThreadType } from "./zalo.mjs";
 
 const CONF_DIR = process.env.ZALO_BRIDGE_CONFIG_DIR || path.join(os.homedir(), ".config/zalo-openmausbot-bridge");
 const STATE_DIR = process.env.ZALO_BRIDGE_STATE_DIR || path.join(os.homedir(), ".local/state/zalo-openmausbot-bridge");
@@ -21,11 +21,14 @@ const cfg = {
   maxBuffered: 200,
   extraRules: [],
   ombEventsDir: "~/.openmausbot/events",
+  outboxDir: "~/zalo-outbox",
   followUpHours: 336,
   ...JSON.parse(fs.readFileSync(path.join(CONF_DIR, "config.json"), "utf8")),
 };
 cfg.inboxDir = expandHome(cfg.inboxDir);
 cfg.ombEventsDir = expandHome(cfg.ombEventsDir);
+cfg.outboxDir = expandHome(cfg.outboxDir);
+fs.mkdirSync(cfg.outboxDir, { recursive: true, mode: 0o700 });
 for (const k of ["groupId", "ownerUid", "botId", "botApiBase"]) {
   if (!cfg[k]) throw new Error(`config.json thiếu "${k}"`);
 }
@@ -57,6 +60,29 @@ function chunks(text) {
 
 function stripMarkdown(s) {
   return s.replace(/\*\*(.+?)\*\*/g, "$1").replace(/^#{1,6}\s+/gm, "").replace(/`{1,3}/g, "");
+}
+
+// Pulls "[[file: /abs/path]]" lines out of a reply. Only regular files under
+// outboxDir or inboxDir (after resolving symlinks), up to 25 MB each and 10 per
+// reply, are accepted, so the bot cannot post arbitrary files from the host.
+const MAX_SEND_BYTES = 25 * 1024 * 1024;
+function extractFiles(text) {
+  const files = [];
+  const rejected = [];
+  const roots = [cfg.outboxDir, cfg.inboxDir].map((r) => { try { return fs.realpathSync(r); } catch { return null; } }).filter(Boolean);
+  const body = text.replace(/^[ \t]*\[\[\s*file\s*:\s*(.+?)\s*\]\][ \t]*$/gim, (_, p) => {
+    try {
+      const real = fs.realpathSync(expandHome(p.trim()));
+      const st = fs.statSync(real);
+      const inside = roots.some((r) => real === r || real.startsWith(r + path.sep));
+      if (!inside || !st.isFile() || st.size > MAX_SEND_BYTES || files.length >= 10) throw new Error("not allowed");
+      files.push(real);
+    } catch {
+      rejected.push(p.trim());
+    }
+    return "";
+  });
+  return { body: body.replace(/\n{3,}/g, "\n\n").trim(), files, rejected };
 }
 
 function formatRecord(r) {
@@ -94,6 +120,7 @@ function buildPrompt(trigger, buffered) {
     `- Việc nội bộ (giao việc cho team, issue, PR, tiến độ chi tiết) em xử lý và báo ${owner} trong OpenMausBot như bình thường, không đưa vào câu trả lời này.`,
     `- Cần ${owner} quyết định thì viết "@${cfg.ownerName}" kèm câu hỏi ngắn; hệ thống sẽ tag thật.`,
     `- Nếu không cần nói gì vào nhóm, trả lời đúng một từ: NO_REPLY`,
+    `- Muốn gửi ảnh hoặc file vào nhóm (ảnh chụp màn hình, bản in, báo cáo...): lưu file vào thư mục ${cfg.outboxDir} rồi thêm một dòng riêng [[file: <đường dẫn tuyệt đối>]] cho mỗi file (tối đa 10 file, mỗi file ≤ 25MB). Gửi lại file khách đã gửi thì dùng đúng đường dẫn trong danh sách tin ở trên. File ngoài hai thư mục này sẽ không được gửi.`,
     `- Việc cần thời gian (giao team, chờ kết quả): khi xong hoặc có tiến triển đáng báo, hãy báo lại ngay trong chính cuộc trò chuyện này, dù là nhiều giờ sau. Mỗi lần báo thêm cũng lên nhóm, trả lời vào đúng tin yêu cầu gốc, nên hãy mở đầu bằng việc gì đã xong hoặc đang ở bước nào (nhắc lại yêu cầu thật ngắn), rồi kết quả và cách dùng hoặc kiểm tra; đừng chỉ viết "xong rồi".`,
     ...cfg.extraRules.map((r) => `- ${r}`),
   ].join("\n");
@@ -172,7 +199,7 @@ function watchThread(thread, quote) {
   log(`watching thread=${thread.slice(0, 8)} seen=${seen.length}`);
 }
 
-function startFollowUps(send) {
+function startFollowUps(post) {
   setInterval(async () => {
     const now = Date.now();
     const before = state.watch.length;
@@ -184,13 +211,8 @@ function startFollowUps(send) {
         w.seen.push(a.id);
         changed = true;
         saveState();
-        const text = stripMarkdown(a.text).trim();
-        if (!text || text === "NO_REPLY") continue;
         log(`follow-up thread=${w.thread.slice(0, 8)} item=${a.id.slice(-8)}`);
-        const parts = chunks(text);
-        for (let i = 0; i < parts.length; i++) {
-          await send(parts[i], i === 0 ? w.quote : null).catch((err) => log(`follow-up send failed: ${err.message}`));
-        }
+        await post(a.text, w.quote).catch((err) => log(`follow-up send failed: ${err.message}`));
       }
     }
     if (changed) saveState();
@@ -213,7 +235,27 @@ async function main() {
     log(`sent group msgId=${r?.message?.msgId || "none"} len=${t.length}`);
     return r;
   };
-  startFollowUps(send);
+  // Posts one bot answer: text first (quoting the request), then any files it
+  // attached with [[file: ...]] lines.
+  const post = async (raw, quote) => {
+    const { body, files, rejected } = extractFiles(raw || "");
+    const text = stripMarkdown(body).trim();
+    const hasText = text && text !== "NO_REPLY";
+    if (!hasText && !files.length) { log("bot: NO_REPLY"); return; }
+    if (hasText) {
+      const parts = chunks(text);
+      for (let i = 0; i < parts.length; i++) await send(parts[i], i === 0 ? quote : null);
+    }
+    if (files.length) {
+      const r = await sendGroupFiles(api, cfg.groupId, files, hasText ? null : quote);
+      log(`sent group files=${files.length} ok=${(r?.attachment || []).length}`);
+    }
+    if (rejected.length) {
+      log(`rejected files=${rejected.length}`);
+      await send(`@${cfg.ownerName} ${cfg.botName} muốn gửi ${rejected.length} file nhưng file nằm ngoài thư mục cho phép hoặc quá lớn, nên chưa gửi.`).catch(() => {});
+    }
+  };
+  startFollowUps(post);
 
   api.listener.on("message", async (msg) => {
     if (msg.type !== ThreadType.Group || msg.isSelf || msg.threadId !== cfg.groupId) return;
@@ -237,13 +279,7 @@ async function main() {
         onWorking: () => send(`Đã nhận, ${cfg.botName} đang xử lý, có kết quả em báo ngay.`, quote),
         onApproval: () => send(`@${cfg.ownerName} ${cfg.botName} cần duyệt một bước trong OpenMausBot.`, quote),
       });
-      const text = reply ? stripMarkdown(reply).trim() : "";
-      if (!text || text === "NO_REPLY") log("bot: NO_REPLY");
-      else {
-        const parts = chunks(text);
-        for (let i = 0; i < parts.length; i++) await send(parts[i], i === 0 ? quote : null);
-        log(`posted reply parts=${parts.length}`);
-      }
+      await post(reply, quote);
       watchThread(thread, quote);
     } catch (err) {
       state.buffer.unshift(...buffered);

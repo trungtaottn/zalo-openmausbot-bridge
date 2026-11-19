@@ -45,6 +45,7 @@ Thành viên nhắn, gửi ảnh/file (không tag)        Chủ nhóm: "@<tài k
   - Chữ `@<ownerName>` được đổi thành tag thật.
   - Câu dài hơn 1800 ký tự được tách nhiều tin. Markdown bị bỏ.
 - **Câu trả lời lượt sau:** bot thường trả lời ngay một câu ("đã giao team"), rồi khi team làm xong lại viết thêm câu trả lời trong cùng thread. `GET` của Bot API chỉ trả câu đầu tiên, nên bridge đọc thẳng log sự kiện của thread trong `ombEventsDir` (OpenMausBot chạy cùng máy). Mỗi câu trả lời hoàn chỉnh mới (`item.completed` / `assistant_text`) được gửi vào nhóm đúng một lần. Mỗi thread được theo dõi trong `followUpHours` giờ (mặc định 14 ngày), danh sách lưu trong file state nên restart không mất. Prompt dặn bot báo lại trong chính thread khi xong và mở đầu bằng việc gì đã xong. Đây là định dạng nội bộ của OpenMausBot; nếu bản OpenMausBot mới đổi định dạng thì phần này cần cập nhật.
+- **Gửi ảnh và file vào nhóm:** bot lưu file vào `outboxDir` (mặc định `~/zalo-outbox`) rồi viết một dòng riêng `[[file: /đường/dẫn/tuyệt/đối]]` cho mỗi file trong câu trả lời. Prompt đã hướng dẫn sẵn. Bridge bỏ các dòng đó khỏi phần chữ, gửi chữ trước rồi gửi file. Chỉ nhận file thường nằm trong `outboxDir` hoặc `inboxDir` (đã giải symlink), tối đa 25MB mỗi file và 10 file mỗi câu trả lời, để bot không thể gửi file tùy ý trên máy vào nhóm. File bị từ chối thì bridge tag chủ nhóm báo lại.
 - **Lỗi khi gọi bot:** đưa tin trở lại bộ đệm và tag chủ nhóm để thử lại.
 
 ## Yêu cầu
@@ -116,6 +117,7 @@ node check-groups.mjs <groupId>    # liệt kê thành viên: <uid>  <tên>, tì
 | `maxBuffered` | | Số tin tối đa giữ trong bộ đệm, mặc định 200 |
 | `extraRules` | | Mảng câu dặn thêm cho bot, ví dụ `"Việc kỹ thuật giao cho trưởng IT"` |
 | `ombEventsDir` | | Thư mục log sự kiện của OpenMausBot, mặc định `~/.openmausbot/events` |
+| `outboxDir` | | Thư mục bot đặt file muốn gửi vào nhóm, mặc định `~/zalo-outbox` |
 | `followUpHours` | | Theo dõi câu trả lời lượt sau trong bao nhiêu giờ, mặc định 336 (14 ngày) |
 
 Muốn đặt cấu hình và state ở chỗ khác thì dùng biến môi trường `ZALO_BRIDGE_CONFIG_DIR` và `ZALO_BRIDGE_STATE_DIR`.
@@ -145,7 +147,7 @@ Thử: một thành viên nhắn vài tin kèm ảnh, rồi chủ nhóm tag tài
   - `buffered msg=… from=member files=N`: đã ghi một tin.
   - `trigger msg=… buffered=N`: chủ nhóm vừa tag, N tin được gửi kèm.
   - `bot-api POST status=200|202 thread=…`: bot đã nhận.
-  - `sent group msgId=…`: tin đã lên Zalo.
+  - `sent group msgId=…`: tin đã lên Zalo. `sent group files=N ok=N`: đã gửi file. `rejected files=N`: file bị từ chối.
   - `watching thread=…` / `follow-up thread=…`: đang theo dõi, hoặc vừa gửi câu trả lời lượt sau.
 - **Khởi động lại:** `systemctl --user restart zalo-openmausbot-bridge`. Bộ đệm lưu trong file nên không mất.
 - **Phiên Zalo hết hạn** (log báo `Đăng nhập thất bại` hoặc `listener closed` lặp lại): `systemctl --user stop zalo-openmausbot-bridge`, chạy `node login-qr.mjs`, rồi `start` lại.
@@ -161,7 +163,7 @@ Thử: một thành viên nhắn vài tin kèm ảnh, rồi chủ nhóm tag tài
 | `login-qr.mjs` | Đăng nhập Zalo bằng QR, lưu phiên |
 | `check-groups.mjs` | Tìm `groupId` và `ownerUid` |
 | `check-login.mjs` | Kiểm tra phiên và quyền thấy nhóm |
-| `check-send.mjs` | Gửi tin thử (`owner` hoặc `group`) |
+| `check-send.mjs` | Gửi tin thử (`owner` hoặc `group`), thêm đường dẫn file để thử gửi ảnh/file |
 | `check-history.mjs` | Xem nhanh các tin gần nhất của nhóm |
 | `deploy/` | Unit systemd và cấu hình mẫu |
 

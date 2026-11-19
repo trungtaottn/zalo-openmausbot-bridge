@@ -11,5 +11,6 @@
   "maxBuffered": 200,
   "extraRules": [],
   "ombEventsDir": "~/.openmausbot/events",
-  "followUpHours": 336
+  "followUpHours": 336,
+  "outboxDir": "~/zalo-outbox"
 }

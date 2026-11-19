@@ -11,6 +11,7 @@
   "type": "module",
   "private": true,
   "dependencies": {
+    "image-size": "2.1.0",
     "zca-js": "2.3.0"
   },
   "engines": {

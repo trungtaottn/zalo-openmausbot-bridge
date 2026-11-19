@@ -1,15 +1,26 @@
 // Zalo side of the bridge: login with saved cookies, normalize incoming group
 // messages, download attachments, and send text (with optional @owner mention).
 import { Zalo, ThreadType } from "zca-js";
+import { imageSizeFromFile } from "image-size/fromFile";
 import fs from "node:fs";
 import path from "node:path";
 
 const MAX_FILE_BYTES = 25 * 1024 * 1024;
 const HISTORY_TIMEOUT_MS = 5000;
 
+// zca-js needs image dimensions to send images by file path.
+async function imageMetadataGetter(filePath) {
+  try {
+    const { width, height } = await imageSizeFromFile(filePath);
+    return { width, height, size: fs.statSync(filePath).size };
+  } catch {
+    return null;
+  }
+}
+
 export async function loginZalo(credentialsPath) {
   const creds = JSON.parse(fs.readFileSync(credentialsPath, "utf8"));
-  const zalo = new Zalo({ selfListen: false, checkUpdate: false, logging: false });
+  const zalo = new Zalo({ selfListen: false, checkUpdate: false, logging: false, imageMetadataGetter });
   // Some exported sessions (e.g. from goclaw) store cookies with empty domain/path; scope
   // them to zalo.me so the cookie jar sends them to chat.zalo.me and wpa.
   const cookie = (Array.isArray(creds.cookie) ? creds.cookie : creds.cookie.cookies).map((c) => ({
@@ -225,6 +236,13 @@ export async function sendGroupText(api, groupId, text, ownerUid, ownerName, quo
     i = text.indexOf(tag, i + tag.length);
   }
   const content = mentions.length ? { msg: text, mentions } : { msg: text };
+  if (quote) content.quote = quote;
+  return api.sendMessage(content, groupId, ThreadType.Group);
+}
+
+// Sends local files (images, documents, videos) to a group as attachments.
+export async function sendGroupFiles(api, groupId, filePaths, quote = null) {
+  const content = { msg: "", attachments: filePaths };
   if (quote) content.quote = quote;
   return api.sendMessage(content, groupId, ThreadType.Group);
 }
