@@ -32,13 +32,18 @@ Thành viên nhắn, gửi ảnh/file (không tag)        Chủ nhóm: "@<tài k
 
 - **Không tag:** chỉ ghi lại, không trả lời ai. Giữ tối đa `maxBuffered` tin. Ảnh, file, video, voice được tải về `inboxDir`, kể cả ảnh/file nằm trong tin được trả lời (quote).
 - **Kích hoạt:** người gửi phải có đúng `ownerUid` **và** tin phải tag tài khoản bot. Kiểm tra theo UID, không theo tên hiển thị.
-- **Gửi cho bot:** mỗi lần là một thread Bot API mới. Prompt có sẵn quy ước:
+- **Một cuộc trò chuyện cho cả nhóm:** mọi lần tag đều nói tiếp trong cùng một thread Bot API (id lưu trong file state), nên lệnh sau có thể bổ sung, đổi hướng hay hủy việc trước. Bot không mở thêm một cuộc song song để làm lại từ đầu. Prompt dặn bot: khi đổi hướng hoặc hủy thì báo teammate liên quan qua `coordinate_bots` (`rework`).
+  - **Mở cuộc mới:** tag kèm `#moi` (hoặc `#mới`, `#new`) làm chữ đầu tiên sau phần tag, ví dụ `@<tài khoản bot> #moi làm báo cáo tồn kho`. Dùng khi sang việc khác hẳn, hoặc khi cuộc hiện tại đã dài nhiều ngày, vì mỗi lượt bot đọc lại toàn bộ lịch sử. Muốn đổi hay hủy việc đang làm thì tag bình thường, đừng dùng `#moi`, nếu không sẽ có hai cuộc chạy song song. Chữ "mới" đứng trơn không có tác dụng.
+  - **Khi bot đang bận:** một thread chỉ chạy một lượt một lúc (Bot API trả `409`). Bridge báo "Đã nhận, <botName> đang làm dở việc trước" một lần, cứ 20 giây thử lại, và gộp các lệnh tag thêm trong lúc chờ thành một tin theo đúng thứ tự. Bận quá 20 phút thì tag chủ nhóm một lần nhưng vẫn tiếp tục chờ. Lệnh `#moi` không phải chờ, nên cũng là cách thoát khi cuộc hiện tại bị kẹt.
+  - **Thread không dùng tiếp được** (`404`, hoặc `403` vì key không còn "Acts as me"): bridge tự mở thread mới.
+  - Các thread cũ vẫn chạy tiếp và vẫn được theo dõi câu trả lời lượt sau như bình thường.
+- **Gửi cho bot:** prompt có sẵn quy ước:
   - Câu trả lời sẽ lên nhóm, mọi thành viên đọc được.
   - Việc nội bộ thì báo chủ nhóm trong OpenMausBot.
   - Cần chủ nhóm quyết định thì viết `@<ownerName>`.
   - Không cần nói gì thì trả `NO_REPLY`.
   - Có thể thêm luật riêng bằng `extraRules`.
-- **Trả lời** (mọi câu của một việc, gồm "đã nhận", câu trả lời đầu và các cập nhật sau, đều gửi dạng trả lời có trích tin giao việc gốc, nên biết ngay cập nhật cho yêu cầu nào; nếu Zalo từ chối trích thì gửi tin thường):
+- **Trả lời** ("đã nhận" và câu trả lời đầu trích tin giao việc; các cập nhật sau trích lệnh gần nhất của cuộc trò chuyện đó, và prompt dặn bot mở đầu bằng việc gì đã xong; nếu Zalo từ chối trích thì gửi tin thường):
   - `200`: gửi ngay.
   - `202 working`: báo "Đã nhận, <botName> đang xử lý" một lần, rồi 30 giây hỏi lại một lần, tối đa 6 giờ.
   - `202 needs_approval`: tag chủ nhóm để vào OpenMausBot duyệt.
@@ -145,8 +150,8 @@ Thử: một thành viên nhắn vài tin kèm ảnh, rồi chủ nhóm tag tài
 
 - **Log:** `journalctl --user -u zalo-openmausbot-bridge -f`. Log chỉ có mã tin, số file và trạng thái, không có nội dung tin.
   - `buffered msg=… from=member files=N`: đã ghi một tin.
-  - `trigger msg=… buffered=N`: chủ nhóm vừa tag, N tin được gửi kèm.
-  - `bot-api POST status=200|202 thread=…`: bot đã nhận.
+  - `trigger msg=… buffered=N [fresh]`: chủ nhóm vừa tag, N tin được gửi kèm; `fresh` là lệnh `#moi`.
+  - `bot-api POST status=200|202 thread=… (continue|new)`: bot đã nhận, nói tiếp thread cũ hoặc mở thread mới. `status=409`: thread đang bận, bridge sẽ thử lại. `current thread=…`: thread của nhóm vừa đổi.
   - `sent group msgId=…`: tin đã lên Zalo. `sent group files=N ok=N`: đã gửi file. `rejected files=N`: file bị từ chối.
   - `watching thread=…` / `follow-up thread=…`: đang theo dõi, hoặc vừa gửi câu trả lời lượt sau.
 - **Khởi động lại:** `systemctl --user restart zalo-openmausbot-bridge`. Bộ đệm lưu trong file nên không mất.

@@ -44,6 +44,27 @@ let state = loadState();
 state.watch ||= [];
 const saveState = () => fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 1), { mode: 0o600 });
 
+// While the group's thread is mid-turn the Bot API answers 409: retry every
+// 20 s, and tag the owner once if it stays busy for 20 minutes (the longest
+// observed coordinator turn was about 15 minutes).
+const BUSY_RETRY_MS = 20_000;
+const BUSY_ALERT_MS = 20 * 60_000;
+
+// "#moi" / "#mới" / "#new" as the first word once the @mentions are cut out
+// opens a new conversation. A bare "mới" is too common in Vietnamese to count.
+const FRESH_TAG = /^#(?:moi|mới|new)(?=$|[\s:,.!])/iu;
+const FRESH_TAG_ANYWHERE = /(^|\s)#(?:moi|mới|new)(?=$|[\s:,.!])[:,.!]?/iu;
+function isFreshCommand(d) {
+  let text = typeof d?.content === "string" ? d.content : "";
+  const mentions = d?.mentions || [];
+  const spans = mentions.filter((m) => Number.isInteger(m.pos) && m.len > 0).sort((a, b) => b.pos - a.pos);
+  // Without mention positions the name can't be cut reliably; a hashtag is
+  // deliberate enough to accept anywhere then.
+  if (mentions.length && !spans.length) return FRESH_TAG_ANYWHERE.test(text.normalize("NFC"));
+  for (const m of spans) text = text.slice(0, m.pos) + text.slice(m.pos + m.len);
+  return FRESH_TAG.test(text.normalize("NFC").trim());
+}
+
 const ZALO_MAX = 1800;
 function chunks(text) {
   const out = [];
@@ -101,20 +122,35 @@ function formatRecord(r) {
   return lines.join("\n");
 }
 
-function buildPrompt(trigger, buffered) {
-  const history = buffered.length ? buffered.map(formatRecord).join("\n") : "(không có tin nào trước lệnh này)";
+// `items` are the owner's commands in arrival order, each with the group
+// messages recorded before it. `fresh` means this opens a new conversation.
+function buildPrompt(items, fresh) {
   const owner = cfg.ownerLabel;
-  return [
-    `Tin từ nhóm Zalo${cfg.project ? ` dự án ${cfg.project}` : ""}, chuyển qua cầu Zalo.`,
-    `Trong nhóm có thể có khách hàng. ${owner[0].toUpperCase() + owner.slice(1)} vừa tag và ra lệnh, kèm các tin trong nhóm kể từ lần chuyển trước.`,
-    `File và ảnh đã được tải sẵn về máy chủ theo đường dẫn ghi bên dưới, em đọc trực tiếp được.`,
+  const Owner = owner[0].toUpperCase() + owner.slice(1);
+  const sections = items.flatMap((it, i) => [
+    ...(items.length > 1 ? [`=== LỆNH ${i + 1}/${items.length} ===`] : []),
+    `CÁC TIN TRONG NHÓM TRƯỚC LỆNH NÀY:`,
+    it.buffered.length ? it.buffered.map(formatRecord).join("\n") : "(không có tin nào)",
     ``,
     `LỆNH CỦA ${owner.toUpperCase()}:`,
-    formatRecord(trigger),
+    formatRecord(it.rec),
     ``,
-    `CÁC TIN TRONG NHÓM TỪ LẦN TRƯỚC:`,
-    history,
+  ]);
+  const intro = fresh
+    ? [
+        `Tin từ nhóm Zalo${cfg.project ? ` dự án ${cfg.project}` : ""}, chuyển qua cầu Zalo. Đây là cuộc trò chuyện MỚI cho nhóm này: mọi lệnh sau của ${owner} trong nhóm sẽ tiếp tục ngay tại đây.`,
+        `Trong nhóm có thể có khách hàng. ${Owner} vừa tag và ra lệnh, kèm các tin trong nhóm kể từ lần chuyển trước.`,
+      ]
+    : [
+        `Tin tiếp theo từ nhóm Zalo${cfg.project ? ` dự án ${cfg.project}` : ""}, trong cùng cuộc trò chuyện. ${Owner} vừa tag và ra lệnh, kèm các tin trong nhóm kể từ lần chuyển trước.`,
+        `Lệnh mới có thể bổ sung, đổi hướng hoặc hủy việc em đang làm hay đã giao. Nếu đổi hướng hoặc hủy, báo ngay teammate liên quan (coordinate_bots, rework) để họ dừng hoặc làm theo hướng mới, đừng để hai hướng chạy song song.`,
+      ];
+  return [
+    ...intro,
+    ...(items.length > 1 ? [`Có ${items.length} lệnh gửi liên tiếp trong lúc em đang bận; làm theo thứ tự, lệnh sau thắng nếu mâu thuẫn.`] : []),
+    `File và ảnh đã được tải sẵn về máy chủ theo đường dẫn ghi bên dưới, em đọc trực tiếp được.`,
     ``,
+    ...sections,
     `QUY ƯỚC TRẢ LỜI: toàn bộ câu trả lời của em sẽ được gửi NGUYÊN VĂN vào nhóm Zalo, mọi thành viên đọc được.`,
     `- Viết tiếng Việt, ngắn (1-5 câu), lịch sự, không markdown, không link nội bộ, không chi tiết kỹ thuật nội bộ.`,
     `- Việc nội bộ (giao việc cho team, issue, PR, tiến độ chi tiết) em xử lý và báo ${owner} trong OpenMausBot như bình thường, không đưa vào câu trả lời này.`,
@@ -148,13 +184,21 @@ async function botApi(method, query, payload) {
   return { status: res.status, body };
 }
 
-// Sends one prompt to the bot in a fresh API thread and resolves with her final
-// reply text (or null). Long work answers 202 "working"; an approval request
-// answers 202 "needs_approval" and waits for the owner in the app.
-async function askBot(prompt, { onWorking, onApproval }) {
-  let { status, body } = await botApi("POST", "", { message: prompt, wait: 50 });
-  const thread = body?.thread;
-  log(`bot-api POST status=${status} thread=${thread ? thread.slice(0, 8) : "-"} state=${body?.status || ""}`);
+const tagged = (err, flag) => Object.assign(err, { [flag]: true });
+
+// Sends one prompt to the bot, continuing `thread` when given (otherwise the
+// API opens a new one), and resolves with her final reply text (or null).
+// Long work answers 202 "working"; an approval request answers 202
+// "needs_approval" and waits for the owner in the app. Throws `busy` when the
+// thread is mid-turn or the bot/key is at a limit (retry later), and `lost`
+// when the thread can no longer be continued (open a new one).
+async function askBot(prompt, { thread: target, onThread, onWorking, onApproval }) {
+  let { status, body } = await botApi("POST", "", target ? { message: prompt, thread: target, wait: 50 } : { message: prompt, wait: 50 });
+  const thread = body?.thread || target;
+  log(`bot-api POST status=${status} thread=${thread ? thread.slice(0, 8) : "-"}${target ? " (continue)" : " (new)"} state=${body?.status || ""}`);
+  if (status === 409 || status === 429) throw tagged(new Error(`Bot API ${status}`), "busy");
+  if (target && (status === 404 || status === 403)) throw tagged(new Error(`Bot API ${status}: ${JSON.stringify(body).slice(0, 120)}`), "lost");
+  if (thread && (status === 200 || status === 202)) onThread?.(thread);
   let toldWorking = false;
   let toldApproval = false;
   const deadline = Date.now() + 6 * 60 * 60 * 1000;
@@ -191,12 +235,30 @@ function completedAnswers(thread) {
   return out;
 }
 
-function watchThread(thread, quote) {
-  if (!thread || state.watch.some((w) => w.thread === thread)) return;
-  const seen = completedAnswers(thread).map((a) => a.id);
-  state.watch.push({ thread, seen, quote, until: Date.now() + cfg.followUpHours * 3600_000 });
+// Threads with a hand-off in flight: the hand-off posts that answer itself, so
+// the follow-up poller leaves them alone until it is done.
+// Counted, since a queued command and a "#moi" can briefly target the same thread.
+const inFlight = new Map();
+const hold = (t) => inFlight.set(t, (inFlight.get(t) || 0) + 1);
+const release = (t) => (inFlight.get(t) > 1 ? inFlight.set(t, inFlight.get(t) - 1) : inFlight.delete(t));
+
+// Called after a hand-off's reply was posted. Answers that appeared during the
+// hand-off (not in `before`) were part of that reply, so they count as seen;
+// older unseen answers are left for the poller. Later follow-ups quote the
+// newest request.
+function watchThread(thread, quote, before) {
+  if (!thread) return;
+  const ids = completedAnswers(thread).map((a) => a.id);
+  const until = Date.now() + cfg.followUpHours * 3600_000;
+  const w = state.watch.find((x) => x.thread === thread);
+  if (w) {
+    for (const id of ids) if (!before.has(id) && !w.seen.includes(id)) w.seen.push(id);
+    Object.assign(w, { quote, until });
+  } else {
+    state.watch.push({ thread, seen: ids, quote, until });
+  }
   saveState();
-  log(`watching thread=${thread.slice(0, 8)} seen=${seen.length}`);
+  log(`watching thread=${thread.slice(0, 8)} seen=${(w || state.watch.at(-1)).seen.length}`);
 }
 
 function startFollowUps(post) {
@@ -206,7 +268,9 @@ function startFollowUps(post) {
     state.watch = state.watch.filter((w) => w.until > now);
     let changed = state.watch.length !== before;
     for (const w of state.watch) {
+      if (inFlight.has(w.thread)) continue;
       for (const a of completedAnswers(w.thread)) {
+        if (inFlight.has(w.thread)) break;
         if (w.seen.includes(a.id)) continue;
         w.seen.push(a.id);
         changed = true;
@@ -257,6 +321,86 @@ async function main() {
   };
   startFollowUps(post);
 
+  // Hand-offs. Every command continues the group's one conversation
+  // (state.thread), so a later command can change or cancel earlier work
+  // instead of a second conversation doing it in parallel. "#moi" opens a new
+  // conversation. A thread takes one turn at a time: while it is busy,
+  // commands queue up and go together once it is free.
+  const queue = [];
+  let draining = false;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  const deliver = async (items, fresh) => {
+    const startedAt = Date.now();
+    let toldQueued = false;
+    let toldStuck = false;
+    for (;;) {
+      const target = fresh ? null : state.thread || null;
+      const quote = items.at(-1).quote;
+      const before = new Set(target ? completedAnswers(target).map((a) => a.id) : []);
+      const held = target ? [target] : [];
+      if (target) hold(target);
+      try {
+        const res = await askBot(buildPrompt(items, !target), {
+          thread: target,
+          onThread: (t) => {
+            if (!held.includes(t)) { held.push(t); hold(t); }
+            if (state.thread !== t) { state.thread = t; saveState(); log(`current thread=${t.slice(0, 8)}`); }
+          },
+          onWorking: () => (toldQueued ? null : send(`Đã nhận${target ? "" : " (việc mới)"}, ${cfg.botName} đang xử lý, có kết quả em báo ngay.`, quote)),
+          onApproval: () => send(`@${cfg.ownerName} ${cfg.botName} cần duyệt một bước trong OpenMausBot.`, quote),
+        });
+        await post(res.reply, quote);
+        watchThread(res.thread, quote, before);
+        return;
+      } catch (err) {
+        if (err.busy) {
+          if (!toldQueued) {
+            toldQueued = true;
+            await send(`Đã nhận, ${cfg.botName} đang làm dở việc trước, xong em chuyển ngay.`, items[0].quote).catch(() => {});
+          }
+          if (!toldStuck && Date.now() - startedAt > BUSY_ALERT_MS) {
+            toldStuck = true;
+            await send(`@${cfg.ownerName} ${cfg.botName} bận hơn ${BUSY_ALERT_MS / 60_000} phút, chưa nhận được lệnh mới, có thể đang kẹt. Em vẫn chờ; muốn bắt đầu cuộc mới thì tag kèm #moi.`, quote).catch(() => {});
+          }
+          await sleep(BUSY_RETRY_MS);
+          items.push(...queue.splice(0));
+          continue;
+        }
+        if (err.lost) {
+          log(`thread=${target.slice(0, 8)} can't be continued (${err.message}), opening a new one`);
+          if (state.thread === target) { state.thread = null; saveState(); }
+          fresh = true;
+          continue;
+        }
+        state.buffer.unshift(...items.flatMap((it) => it.buffered));
+        saveState();
+        log(`hand-off failed: ${err.message}`);
+        await send(`@${cfg.ownerName} chưa chuyển được cho ${cfg.botName} (${err.message.slice(0, 120)}). Tag lại sau ít phút nhé.`, quote).catch(() => {});
+        return;
+      } finally {
+        held.forEach(release);
+      }
+    }
+  };
+
+  const drain = async () => {
+    if (draining) return;
+    draining = true;
+    try {
+      while (queue.length) await deliver(queue.splice(0), false);
+    } finally {
+      draining = false;
+    }
+  };
+
+  // "#moi" skips the queue: it may be how the owner gets past a stuck thread.
+  // Commands still waiting go along with it into the new conversation.
+  const handOff = (item) => {
+    if (!item.fresh) { queue.push(item); drain(); return; }
+    deliver([...queue.splice(0), item], true).catch((err) => log(`hand-off crashed: ${err.stack || err.message}`));
+  };
+
   api.listener.on("message", async (msg) => {
     if (msg.type !== ThreadType.Group || msg.isSelf || msg.threadId !== cfg.groupId) return;
     const rec = await normalizeGroupMessage(msg, cfg.inboxDir, log, api);
@@ -273,20 +417,10 @@ async function main() {
     // Take the buffer synchronously so two quick commands never share messages.
     const buffered = state.buffer.splice(0);
     saveState();
-    log(`trigger msg=${rec.msgId} buffered=${buffered.length}`);
-    try {
-      const { reply, thread } = await askBot(buildPrompt(rec, buffered), {
-        onWorking: () => send(`Đã nhận, ${cfg.botName} đang xử lý, có kết quả em báo ngay.`, quote),
-        onApproval: () => send(`@${cfg.ownerName} ${cfg.botName} cần duyệt một bước trong OpenMausBot.`, quote),
-      });
-      await post(reply, quote);
-      watchThread(thread, quote);
-    } catch (err) {
-      state.buffer.unshift(...buffered);
-      saveState();
-      log(`hand-off failed: ${err.message}`);
-      await send(`@${cfg.ownerName} chưa chuyển được cho ${cfg.botName} (${err.message.slice(0, 120)}). Tag lại sau ít phút nhé.`, quote).catch(() => {});
-    }
+    const fresh = isFreshCommand(msg.data);
+    if (fresh) rec.text = rec.text.normalize("NFC").replace(FRESH_TAG_ANYWHERE, "$1").replace(/\s{2,}/g, " ").trim();
+    log(`trigger msg=${rec.msgId} buffered=${buffered.length}${fresh ? " fresh" : ""}`);
+    handOff({ rec, buffered, quote, fresh });
   });
 
   api.listener.on("connected", () => log("listener connected"));
