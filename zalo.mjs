@@ -225,16 +225,49 @@ export function quoteRefOf(d) {
   };
 }
 
-// Sends text to a group, optionally as a reply quoting `quote` (see quoteRefOf).
-// Every "@<ownerName>" occurrence becomes a real mention of ownerUid.
-export async function sendGroupText(api, groupId, text, ownerUid, ownerName, quote = null) {
-  const tag = `@${ownerName}`;
-  const mentions = [];
-  let i = text.indexOf(tag);
-  while (i !== -1) {
-    mentions.push({ pos: i, uid: ownerUid, len: tag.length });
-    i = text.indexOf(tag, i + tag.length);
+// Current members of a group as [{ uid, name }], name being the display name
+// (or Zalo name when no display name is set).
+export async function groupMembers(api, groupId) {
+  const info = await api.getGroupInfo(groupId);
+  const g = info.gridInfoMap?.[groupId];
+  if (!g) throw new Error("group not found for this account");
+  const ids = (g.memVerList || []).map((x) => String(x).split("_")[0]);
+  const out = [];
+  for (let i = 0; i < ids.length; i += 50) {
+    const prof = await api.getGroupMembersInfo(ids.slice(i, i + 50));
+    for (const id of ids.slice(i, i + 50)) {
+      const p = prof.profiles?.[id] || prof.profiles?.[`${id}_0`] || {};
+      const name = (p.displayName || p.zaloName || "").trim();
+      if (name) out.push({ uid: id, name });
+    }
   }
+  return out;
+}
+
+// Real mentions for every "@<name>" in text, from `people` ([{ name, uid }]).
+// Longer names win ("@Dung Nguyễn" over "@Dung"), and a name only matches as a
+// whole word, so "@An" does not tag inside "@Anh".
+export function mentionsFor(text, people) {
+  const taken = [];
+  const out = [];
+  const sorted = people.filter((p) => p.name && p.uid).sort((a, b) => b.name.length - a.name.length);
+  for (const p of sorted) {
+    const tag = `@${p.name}`;
+    for (let i = text.indexOf(tag); i !== -1; i = text.indexOf(tag, i + 1)) {
+      const end = i + tag.length;
+      if (/[\p{L}\p{N}]/u.test(text[end] || "")) continue;
+      if (taken.some(([a, b]) => i < b && end > a)) continue;
+      taken.push([i, end]);
+      out.push({ pos: i, uid: String(p.uid), len: tag.length });
+    }
+  }
+  return out.sort((a, b) => a.pos - b.pos);
+}
+
+// Sends text to a group, optionally as a reply quoting `quote` (see quoteRefOf).
+// Every "@<name>" of someone in `people` becomes a real mention.
+export async function sendGroupText(api, groupId, text, people, quote = null) {
+  const mentions = mentionsFor(text, people);
   const content = mentions.length ? { msg: text, mentions } : { msg: text };
   if (quote) content.quote = quote;
   return api.sendMessage(content, groupId, ThreadType.Group);
