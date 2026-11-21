@@ -280,4 +280,9 @@ export async function sendGroupFiles(api, groupId, filePaths, quote = null) {
   return api.sendMessage(content, groupId, ThreadType.Group);
 }
 
+// Sends a private text message to one user (the owner's approval channel).
+export async function sendOwnerText(api, uid, text) {
+  return api.sendMessage({ msg: text }, uid, ThreadType.User);
+}
+
 export { ThreadType };

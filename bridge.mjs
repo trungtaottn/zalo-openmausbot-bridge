@@ -7,7 +7,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { loginZalo, normalizeGroupMessage, sendGroupText, sendGroupFiles, groupMembers, quoteRefOf, ThreadType } from "./zalo.mjs";
+import { loginZalo, normalizeGroupMessage, sendGroupText, sendGroupFiles, sendOwnerText, groupMembers, quoteRefOf, ThreadType } from "./zalo.mjs";
 
 const CONF_DIR = process.env.ZALO_BRIDGE_CONFIG_DIR || path.join(os.homedir(), ".config/zalo-openmausbot-bridge");
 const STATE_DIR = process.env.ZALO_BRIDGE_STATE_DIR || path.join(os.homedir(), ".local/state/zalo-openmausbot-bridge");
@@ -51,6 +51,9 @@ state.sent ||= [];
 // members: uid → display name of people who wrote in the group, so the bot can
 // tag them by writing "@<name>".
 state.members ||= {};
+// approvals: code → { thread, at } for jobs waiting for the owner's approval in
+// OpenMausBot. The owner's private reply is routed to one of them.
+state.approvals ||= {};
 for (const r of state.buffer || []) {
   if (r.senderId !== cfg.ownerUid && r.senderName && r.senderName !== r.senderId && !state.members[r.senderId]) {
     state.members[r.senderId] = { name: r.senderName, at: Date.parse(r.ts) || Date.now() };
@@ -387,6 +390,47 @@ async function main() {
     state.sent.push({ id: String(msgId), thread: meta.thread, code: meta.code || null, text: text.slice(0, 80), at: Date.now() });
     saveState();
   };
+  // Private approval channel: the owner's own private messages only.
+  const APPROVAL_TTL_MS = 6 * 3600_000;
+  const dmOwner = async (text) => {
+    try {
+      await sendOwnerText(api, cfg.ownerUid, text.normalize("NFC"));
+    } catch (err) {
+      log(`owner DM failed: ${err.message}`);
+    }
+  };
+  const pendingApprovals = () => {
+    const cutoff = Date.now() - APPROVAL_TTL_MS;
+    for (const [code, a] of Object.entries(state.approvals)) if (a.at < cutoff) delete state.approvals[code];
+    return Object.keys(state.approvals);
+  };
+  // Routes the owner's private reply to the one job waiting for approval: the
+  // only pending job, or the job whose code the reply names.
+  const onOwnerPrivate = async (msg) => {
+    const rec = await normalizeGroupMessage(msg, cfg.inboxDir, log, api);
+    delete rec.raw;
+    const text = (rec.text || "").normalize("NFC").trim();
+    const pending = pendingApprovals();
+    if (!pending.length) { log("owner private: nothing waiting for approval, ignored"); return; }
+    const named = pending.filter((c) => new RegExp(`(^|\\D)${c}(\\D|$)`).test(text));
+    let code = null;
+    if (named.length === 1) code = named[0];
+    else if (!named.length && pending.length === 1) code = pending[0];
+    if (!code) {
+      await dmOwner(`Đang có ${pending.length} việc chờ duyệt (mã ${pending.join(", ")}). Trả lời kèm đúng mã để em chuyển đúng việc.`);
+      return;
+    }
+    if (!text) { log(`owner private msg=${rec.msgId} empty, ignored`); return; }
+    const approval = state.approvals[code];
+    const reqCode = requestCode(rec.msgId);
+    state.requests[reqCode] = { quote: null, text: text.slice(0, 120), thread: approval.thread, at: Date.now() };
+    delete state.approvals[code];
+    pruneMemory();
+    saveState();
+    log(`owner private msg=${rec.msgId} code=${reqCode} approval=${code} thread=${approval.thread.slice(0, 8)}`);
+    handOff({ rec, buffered: [], quote: null, fresh: false, code: reqCode, route: approval.thread, replyTo: null });
+  };
+
   const send = async (t, quote = null, meta = null) => {
     t = t.normalize("NFC");
     let r;
@@ -471,11 +515,18 @@ async function main() {
             saveState();
           },
           onWorking: () => (toldQueued ? null : send(`Đã nhận${target ? "" : " (việc mới)"}, ${cfg.botName} đang xử lý, có kết quả em báo ngay.`, quote, { thread: current, code: lastCode })),
-          onApproval: () => send(`@${cfg.ownerName} ${cfg.botName} cần duyệt một bước trong OpenMausBot.`, quote, { thread: current, code: lastCode }),
+          onApproval: async () => {
+            await send(`@${cfg.ownerName} ${cfg.botName} cần duyệt một bước trong OpenMausBot.`, quote, { thread: current, code: lastCode });
+            state.approvals[lastCode] = { thread: current, at: Date.now() };
+            saveState();
+            await dmOwner(`[${lastCode}] ${cfg.botName} cần duyệt một bước trong OpenMausBot. Trả lời tin này để em chuyển nội dung cho ${cfg.botName}.`);
+          },
         });
         const g = groupMark(res.reply);
         const req = g.code ? state.requests[g.code] : null;
         await post(g.body, req?.quote || quote, { thread: res.thread, code: req ? g.code : lastCode });
+        delete state.approvals[lastCode];
+        saveState();
         watchThread(res.thread, quote, lastCode, before);
         return;
       } catch (err) {
@@ -541,6 +592,13 @@ async function main() {
   };
 
   api.listener.on("message", async (msg) => {
+    if (msg.type === ThreadType.User) {
+      // Private messages count only from the owner; everyone else is ignored.
+      if (!msg.isSelf && String(msg.data?.uidFrom) === cfg.ownerUid) {
+        await onOwnerPrivate(msg).catch((err) => log(`owner private failed: ${err.message}`));
+      }
+      return;
+    }
     if (msg.type !== ThreadType.Group || msg.isSelf || msg.threadId !== cfg.groupId) return;
     const rec = await normalizeGroupMessage(msg, cfg.inboxDir, log, api);
     delete rec.raw;
