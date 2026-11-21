@@ -285,4 +285,9 @@ export async function sendOwnerText(api, uid, text) {
   return api.sendMessage({ msg: text }, uid, ThreadType.User);
 }
 
+// Sends local files to one user as attachments (the owner's private channel).
+export async function sendOwnerFiles(api, uid, filePaths) {
+  return api.sendMessage({ msg: "", attachments: filePaths }, uid, ThreadType.User);
+}
+
 export { ThreadType };
